@@ -1,0 +1,29 @@
+{
+  "MHCC010012345-2024": {
+    "cnr": "MHCC010012345-2024",
+    "case_number": "CRL.BAIL.APPL./1234/2024",
+    "next_hearing_date": "2026-05-22",
+    "case_stage": "Pending — Arguments on Bail Application",
+    "last_updated": "2026-05-01",
+    "court": "Sessions Court, Mumbai",
+    "judge": "Hon'ble Shri V. R. Patil"
+  },
+  "DLCT020034567-2025": {
+    "cnr": "DLCT020034567-2025",
+    "case_number": "CRL.MISC.B./0456/2025",
+    "next_hearing_date": "2026-06-10",
+    "case_stage": "Charge sheet awaited",
+    "last_updated": "2026-04-28",
+    "court": "Tis Hazari Court, Delhi",
+    "judge": "Hon'ble Ms. Priya Sharma"
+  },
+  "UPCC030056789-2024": {
+    "cnr": "UPCC030056789-2024",
+    "case_number": "BAIL.APPL./0789/2024",
+    "next_hearing_date": "2026-05-15",
+    "case_stage": "Default bail application filed under Sec 187 BNSS",
+    "last_updated": "2026-05-03",
+    "court": "District Court, Lucknow",
+    "judge": "Hon'ble Shri A. K. Mishra"
+  }
+}
