@@ -267,32 +267,56 @@ async def _run_generation(
     return {"approved": True, "pdf_url": pdf_url}, court_status
 
 
+def _looks_like_full_report(payload: dict) -> bool:
+    """Detect whether the caller is resubmitting a previously-built BailEligibilityReport."""
+    return all(k in payload for k in ("confidence_score", "bail_grounds", "applicable_sections"))
+
+
 # ---------------------------------------------------------------------------
 # Main endpoint
 # ---------------------------------------------------------------------------
 
 @app.post("/process-case")
 async def process_case(
-    image: Optional[UploadFile] = File(None),
-    manual_fir_data: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+    fir_data_json: Optional[str] = Form(None),
     cnr_number: Optional[str] = Form(None),
     approved: bool = Form(False),
 ) -> JSONResponse:
     pipeline_steps: dict = {}
 
+    # If a previously-built report is being resubmitted for approval, accept it
+    # whole instead of rerunning vision/RAG/audit.
+    parsed_payload: Optional[dict] = None
+    if fir_data_json:
+        try:
+            parsed_payload = json.loads(fir_data_json)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail=f"fir_data_json is not valid JSON: {exc}")
+
+    if approved and parsed_payload and _looks_like_full_report(parsed_payload):
+        bail_report = parsed_payload
+        generation_step, court_status = await _run_generation(bail_report, cnr_number, approved=True)
+        pipeline_steps["generation"] = generation_step
+        return JSONResponse(content={
+            "status": "generated",
+            "pdf_path": generation_step.get("pdf_url") or "",
+            "download_url": generation_step.get("pdf_url") or "",
+            "court_status": court_status,
+            "pipeline_steps": pipeline_steps,
+            "human_review_required": True,
+        })
+
     # ---- STEP 1: Vision or manual entry --------------------------------
-    vision_result, vision_step = _run_vision(image)
+    vision_result, vision_step = _run_vision(file)
     pipeline_steps["vision"] = vision_step
 
     fir_data: Optional[dict] = None
     if vision_result and vision_step["confidence"] >= 40:
         fir_data = vision_result
     else:
-        if manual_fir_data:
-            try:
-                fir_data = json.loads(manual_fir_data)
-            except json.JSONDecodeError as exc:
-                raise HTTPException(status_code=400, detail=f"manual_fir_data is not valid JSON: {exc}")
+        if parsed_payload:
+            fir_data = parsed_payload
         else:
             return JSONResponse(content={
                 "status": "needs_manual_entry",
@@ -315,13 +339,30 @@ async def process_case(
     pipeline_steps["generation"] = generation_step
 
     # ---- STEP 5: Envelope ----------------------------------------------
-    status = "complete" if approved and generation_step.get("pdf_url") else "awaiting_approval"
+    if approved and generation_step.get("pdf_url"):
+        return JSONResponse(content={
+            "status": "generated",
+            "pdf_path": generation_step["pdf_url"],
+            "download_url": generation_step["pdf_url"],
+            "court_status": court_status,
+            "pipeline_steps": pipeline_steps,
+            "human_review_required": True,
+        })
+
+    preview = generation_step.get("preview") or {
+        "accused_name": bail_report.get("accused_name"),
+        "fir_number": bail_report.get("fir_number"),
+        "days_in_custody": bail_report.get("days_in_custody"),
+        "applicable_sections": bail_report.get("applicable_sections", []),
+        "confidence_score": bail_report.get("confidence_score", 0),
+        "summary_excerpt": (bail_report.get("plain_language_summary") or "")[:600],
+    }
 
     return JSONResponse(content={
-        "status": status,
+        "status": "awaiting_human_review",
+        "report": bail_report,
+        "preview": preview,
         "pipeline_steps": pipeline_steps,
-        "bail_report": bail_report,
-        "court_status": court_status,
         "human_review_required": True,
     })
 
