@@ -98,6 +98,24 @@ def _is_bailable_offence(section: str) -> bool:
     return False
 
 
+def _is_non_bailable_offence(section: str) -> bool:
+    return not _is_bailable_offence(section)
+
+
+def _max_sentence_days_for_section(section: str) -> int:
+    entry = _section_entry(section)
+    if entry and entry.get("max_sentence_days"):
+        return int(entry["max_sentence_days"])
+    return _DEFAULT_MAX_SENTENCE_DAYS
+
+
+def _is_death_or_life_or_10yr(section: str) -> bool:
+    """Return True if the section carries death, life imprisonment, or >=10 years."""
+    days = _max_sentence_days_for_section(section)
+    # 10 years = 3650 days; life/death encoded as very large values (e.g. 36500+)
+    return days >= 3650
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -144,40 +162,74 @@ def calculate_bail_score(fir_data: dict, today_date: date) -> dict:
             "reasons": ["Date of arrest is missing — cannot compute custodial duration."],
             "days_in_custody": 0,
             "applicable_sections": [],
+            "is_non_bailable_case": False,
+            "statutory_deadline": 60,
+            "primary_ground": "",
         }
 
     days_in_custody = max((today_date - arrest_date).days, 0)
     estimated_max_sentence_days = _estimate_max_sentence_days(sections_charged)
+
+    # --- Heaviest Charge Rule ---
+    # If ANY section is non-bailable, the whole case is non-bailable.
+    is_non_bailable_case = any(_is_non_bailable_offence(s) for s in sections_charged)
+
+    # Determine the correct statutory deadline (60 vs 90 days).
+    # 90 days applies if the most serious charge carries death, life, or >=10 years.
+    has_serious_charge = any(_is_death_or_life_or_10yr(s) for s in sections_charged)
+    statutory_deadline = 90 if has_serious_charge else 60
 
     score = 0
     reasons: list[str] = []
     applicable: list[str] = []
 
     # Check 1 — Section 187 BNSS (default bail on charge-sheet delay)
-    if days_in_custody > 60 and charge_sheet_not_filed:
+    if charge_sheet_not_filed and days_in_custody > statutory_deadline:
         score += 40
         reasons.append(
-            "Section 187 BNSS: Charge sheet not filed within 60-day limit — default bail triggered"
+            f"Section 187 BNSS: Charge sheet not filed within the {statutory_deadline}-day statutory "
+            f"limit — default bail eligibility triggered regardless of offence gravity"
         )
         applicable.append("BNSS Section 187")
 
     # Check 2 — Section 479 BNSS (half-sentence served as undertrial)
-    if days_in_custody > estimated_max_sentence_days / 2:
+    # Does not apply to offences punishable by death or life imprisonment.
+    life_or_death = any(_max_sentence_days_for_section(s) >= 36500 for s in sections_charged)
+    if not life_or_death and days_in_custody > estimated_max_sentence_days / 2:
         score += 40
         reasons.append(
-            "Section 479 BNSS: Undertrial detention exceeds half of maximum sentence"
+            "Section 479 BNSS: Undertrial detention exceeds half of maximum sentence — "
+            "mandatory release on bond"
+        )
+        applicable.append("BNSS Section 479")
+
+    # Check 2b — Section 479 BNSS first-time offender (1/3 threshold)
+    is_first_time = bool(fir_data.get("is_first_time_offender", False))
+    if (
+        not life_or_death
+        and is_first_time
+        and not any("Section 479" in r for r in reasons)
+        and days_in_custody > estimated_max_sentence_days / 3
+    ):
+        score += 30
+        reasons.append(
+            "Section 479 BNSS (First-Time Offender): Undertrial detention exceeds one-third "
+            "of maximum sentence — eligible for early release as first-time offender"
         )
         applicable.append("BNSS Section 479")
 
     # Check 3 — Section 436 BNSS (bailable offence per First Schedule)
-    if any(_is_bailable_offence(s) for s in sections_charged):
+    # ONLY add this ground if no non-bailable charge exists.
+    if not is_non_bailable_case and any(_is_bailable_offence(s) for s in sections_charged):
         score += 20
         reasons.append(
-            "Section 436 BNSS: Offence classified as bailable — bail is a right, not discretion"
+            "Section 436 BNSS: All charged offences are classified as bailable — "
+            "bail is a right, not a matter of court discretion"
         )
         applicable.append("BNSS Section 436")
 
     score = min(score, 100)
+    primary_ground = reasons[0] if reasons else ""
 
     return {
         "score": score,
@@ -185,6 +237,9 @@ def calculate_bail_score(fir_data: dict, today_date: date) -> dict:
         "days_in_custody": days_in_custody,
         "applicable_sections": applicable,
         "estimated_max_sentence_days": estimated_max_sentence_days,
+        "is_non_bailable_case": is_non_bailable_case,
+        "statutory_deadline": statutory_deadline,
+        "primary_ground": primary_ground,
     }
 
 
@@ -205,20 +260,35 @@ def _format_legal_context(legal_context: list[dict]) -> str:
 
 
 def _build_user_prompt(fir_data: dict, score_result: dict, legal_context: list[dict]) -> str:
+    is_non_bailable = score_result.get("is_non_bailable_case", False)
+    statutory_deadline = score_result.get("statutory_deadline", 60)
+    bail_type_note = (
+        "IMPORTANT: This case includes at least one NON-BAILABLE charge. "
+        "Bail is NOT a right here — it is at the sole discretion of the court. "
+        "Do NOT suggest that bail is guaranteed or a right. Be honest but compassionate."
+        if is_non_bailable
+        else "All charges are bailable. Bail is a right under Section 436 BNSS."
+    )
     return (
         f"Accused: {fir_data.get('accused_name')}\n"
         f"FIR Number: {fir_data.get('fir_number')}\n"
         f"Sections charged: {fir_data.get('sections_charged')}\n"
-        f"Days in custody: {score_result['days_in_custody']}\n\n"
+        f"Days in custody: {score_result['days_in_custody']}\n"
+        f"Statutory deadline for charge sheet: {statutory_deadline} days\n"
+        f"Bail type assessment: {bail_type_note}\n\n"
         f"Deterministic bail score: {score_result['score']}/100\n"
-        f"Triggered legal grounds:\n- "
+        f"Primary ground: {score_result.get('primary_ground', 'None')}\n"
+        f"All triggered legal grounds:\n- "
         + ("\n- ".join(score_result["reasons"]) if score_result["reasons"] else "None triggered")
         + "\n\nRelevant statutory context:\n"
         + _format_legal_context(legal_context)
-        + "\n\nWrite a clear three-paragraph explanation for the family:\n"
-          "Paragraph 1 — State plainly what was found in their loved one's case.\n"
-          "Paragraph 2 — Name the specific BNSS sections that apply and what each one means.\n"
-          "Paragraph 3 — Tell the family exactly what to do next, then end with the mandatory closing line."
+        + "\n\nWrite a clear three-paragraph explanation for the prisoner's family:\n"
+          "Paragraph 1 — State plainly what was found. If the case is non-bailable, say so "
+          "honestly and compassionately — do not give false hope.\n"
+          "Paragraph 2 — Name the specific BNSS sections that apply and what each one means "
+          "in plain language a non-lawyer can understand.\n"
+          "Paragraph 3 — Tell the family exactly what to do next, mentioning the District "
+          "Legal Services Authority (DLSA) for free legal aid. End with the mandatory closing line."
     )
 
 
@@ -236,6 +306,9 @@ class BailEligibilityReport:
     legal_contradictions: list[str]
     plain_language_summary: str
     applicable_sections: list[str]
+    is_non_bailable_case: bool = False
+    statutory_deadline: int = 60
+    primary_ground: str = ""
     human_review_required: bool = True
     disclaimer: str = DISCLAIMER
 
@@ -247,16 +320,20 @@ def _detect_contradictions(fir_data: dict, score_result: dict) -> list[str]:
     """Surface internal inconsistencies that an advocate should examine."""
     contradictions = []
     sections = fir_data.get("sections_charged") or []
-    bailable_hit = any(_is_bailable_offence(s) for s in sections)
-    if bailable_hit and score_result["days_in_custody"] > 30:
+    is_non_bailable = score_result.get("is_non_bailable_case", False)
+    statutory_deadline = score_result.get("statutory_deadline", 60)
+    days = score_result["days_in_custody"]
+
+    if not is_non_bailable and any(_is_bailable_offence(s) for s in sections) and days > 30:
         contradictions.append(
-            "Offence appears bailable yet accused has been in custody beyond 30 days — "
-            "examine whether bail was applied for and rejected."
+            "All offences appear bailable yet the accused has been in custody beyond 30 days — "
+            "examine whether bail was applied for and rejected, or if a non-bailable charge was added."
         )
-    if score_result["days_in_custody"] > 60 and not fir_data.get("charge_sheet_filed", False):
+    if days > statutory_deadline and not fir_data.get("charge_sheet_filed", False):
         contradictions.append(
-            "Custody exceeds the 60-day investigation window without a filed charge sheet — "
-            "default-bail eligibility under Section 187 BNSS should be raised immediately."
+            f"Custody exceeds the {statutory_deadline}-day investigation deadline without a filed "
+            "charge sheet — default-bail eligibility under Section 187 BNSS should be raised "
+            "immediately before the next hearing."
         )
     if not fir_data.get("date_of_arrest"):
         contradictions.append("Date of arrest is missing from the FIR record.")
@@ -294,6 +371,9 @@ def generate_bail_report(
         legal_contradictions=_detect_contradictions(fir_data, score_result),
         plain_language_summary=summary,
         applicable_sections=list(score_result.get("applicable_sections", [])),
+        is_non_bailable_case=bool(score_result.get("is_non_bailable_case", False)),
+        statutory_deadline=int(score_result.get("statutory_deadline", 60)),
+        primary_ground=str(score_result.get("primary_ground", "")),
         human_review_required=True,
         disclaimer=DISCLAIMER,
     )
