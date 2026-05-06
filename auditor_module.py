@@ -1,20 +1,27 @@
 """
 Legal Auditor agent for Project Mukti.
 
-Deterministic scoring + Claude-generated plain-language explanation.
+Deterministic scoring + LLM-generated plain-language explanation.
 The confidence_score is NEVER produced by the LLM — only Python rules set it.
+
+Bail classification and max-sentence data come from bns_bail_mapping.json
+(First Schedule of BNSS, 2023). The score engine is a pure JSON lookup —
+no hardcoded section lists.
 """
 
 from __future__ import annotations
 
+import json
 import os
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from datetime import date, datetime
+from pathlib import Path
 from typing import Optional
 
-import anthropic
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+
+from llm_client import generate_text
 
 
 # ---------------------------------------------------------------------------
@@ -40,31 +47,55 @@ SYSTEM_PROMPT = (
     f"'{CLOSING_LINE}'"
 )
 
-# Bailable offences under BNS / legacy IPC commonly encountered.
-BAILABLE_SECTIONS = {
-    "379", "420", "323", "504", "506",  # legacy IPC
-    "303", "318", "319", "115", "351",  # BNS equivalents
-}
-
-# Indicative maximum-sentence lookup (in days) keyed by section code.
-# Used when fir_data does not supply an explicit estimate.
-_MAX_SENTENCE_DAYS = {
-    "303": 3 * 365,    # Theft — up to 3 years
-    "305": 7 * 365,
-    "309": 10 * 365,   # Robbery
-    "310": 10 * 365,   # Dacoity (max term form)
-    "318": 7 * 365,    # Cheating
-    "319": 5 * 365,
-    "115": 1 * 365,
-    "117": 7 * 365,
-    "351": 2 * 365,
-    "420": 7 * 365,
-    "379": 3 * 365,
-    "323": 1 * 365,
-    "504": 2 * 365,
-    "506": 2 * 365,
-}
 _DEFAULT_MAX_SENTENCE_DAYS = 3 * 365  # conservative fallback
+
+
+# ---------------------------------------------------------------------------
+# JSON data loader
+# ---------------------------------------------------------------------------
+
+_BNS_MAPPING_CACHE: Optional[dict] = None
+
+
+def _get_bns_mapping() -> dict:
+    global _BNS_MAPPING_CACHE
+    if _BNS_MAPPING_CACHE is None:
+        json_path = Path(__file__).parent / "bns_bail_mapping.json"
+        if json_path.exists():
+            with open(json_path, "r", encoding="utf-8") as f:
+                _BNS_MAPPING_CACHE = json.load(f)
+        else:
+            _BNS_MAPPING_CACHE = {}
+    return _BNS_MAPPING_CACHE
+
+
+def _section_entry(section: str) -> Optional[dict]:
+    """Look up a section in the BNS mapping. Tolerates 'Section 303' / '303' / '303_1' forms."""
+    if not section:
+        return None
+    mapping = _get_bns_mapping()
+    s = str(section).strip()
+    s = s.replace("Section ", "").replace("section ", "")
+    entry = mapping.get(s)
+    if isinstance(entry, dict):
+        return entry
+    # Try matching the parent section if user passed just "303" but mapping has "303_1"
+    for key, val in mapping.items():
+        if key.startswith(f"{s}_") and isinstance(val, dict):
+            return val
+    return None
+
+
+def _is_bailable_offence(section: str) -> bool:
+    entry = _section_entry(section)
+    if not entry:
+        return False
+    val = entry.get("is_bailable")
+    if val is True:
+        return True
+    if isinstance(val, str) and val.strip().lower() in ("true", "bailable", "yes"):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +119,11 @@ def _parse_date(value) -> Optional[date]:
 
 def _estimate_max_sentence_days(sections: list[str]) -> int:
     """Pick the harshest known section among those charged."""
-    known = [_MAX_SENTENCE_DAYS[s] for s in (sections or []) if s in _MAX_SENTENCE_DAYS]
+    known: list[int] = []
+    for s in (sections or []):
+        entry = _section_entry(s)
+        if entry and entry.get("max_sentence_days"):
+            known.append(int(entry["max_sentence_days"]))
     return max(known) if known else _DEFAULT_MAX_SENTENCE_DAYS
 
 
@@ -134,8 +169,8 @@ def calculate_bail_score(fir_data: dict, today_date: date) -> dict:
         )
         applicable.append("BNSS Section 479")
 
-    # Check 3 — Section 436 BNSS (bailable offence)
-    if any(s in BAILABLE_SECTIONS for s in sections_charged):
+    # Check 3 — Section 436 BNSS (bailable offence per First Schedule)
+    if any(_is_bailable_offence(s) for s in sections_charged):
         score += 20
         reasons.append(
             "Section 436 BNSS: Offence classified as bailable — bail is a right, not discretion"
@@ -154,11 +189,8 @@ def calculate_bail_score(fir_data: dict, today_date: date) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Step 2 — Claude explanation
+# Step 2 — LLM explanation
 # ---------------------------------------------------------------------------
-
-_anthropic_client = anthropic.Anthropic()
-
 
 def _format_legal_context(legal_context: list[dict]) -> str:
     if not legal_context:
@@ -215,7 +247,7 @@ def _detect_contradictions(fir_data: dict, score_result: dict) -> list[str]:
     """Surface internal inconsistencies that an advocate should examine."""
     contradictions = []
     sections = fir_data.get("sections_charged") or []
-    bailable_hit = any(s in BAILABLE_SECTIONS for s in sections)
+    bailable_hit = any(_is_bailable_offence(s) for s in sections)
     if bailable_hit and score_result["days_in_custody"] > 30:
         contradictions.append(
             "Offence appears bailable yet accused has been in custody beyond 30 days — "
@@ -239,16 +271,14 @@ def generate_bail_report(
     user_prompt = _build_user_prompt(fir_data, score_result, legal_context)
 
     try:
-        response = _anthropic_client.messages.create(
-            model="claude-sonnet-4-5",
+        summary = generate_text(
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt=user_prompt,
             max_tokens=1200,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_prompt}],
         )
-        summary = response.content[0].text.strip()
         if CLOSING_LINE not in summary:
             summary = f"{summary}\n\n{CLOSING_LINE}"
-    except anthropic.APIError as exc:
+    except Exception as exc:
         summary = (
             "An automated explanation could not be generated at this time "
             f"(LLM error: {exc}). The deterministic findings above remain valid. "

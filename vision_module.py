@@ -7,13 +7,12 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import anthropic
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="FIR Vision Extractor")
+from llm_client import generate_with_image
 
-_client = anthropic.Anthropic()
+app = FastAPI(title="FIR Vision Extractor")
 
 SYSTEM_PROMPT = (
     "You are a forensic document reader specialising in Indian legal documents. "
@@ -95,31 +94,17 @@ def extract_fir_details(image_path: str) -> dict:
     enhanced_path: str | None = None
     try:
         enhanced_path = _preprocess_image(image_path)
-        b64_data, media_type = _image_to_base64(enhanced_path)
+        with open(enhanced_path, "rb") as f:
+            image_bytes = f.read()
+        media_type = "image/png"
 
-        response = _client.messages.create(
-            model="claude-sonnet-4-5",
+        raw_text = generate_with_image(
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt=EXTRACTION_PROMPT,
+            image_bytes=image_bytes,
+            mime_type=media_type,
             max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": b64_data,
-                            },
-                        },
-                        {"type": "text", "text": EXTRACTION_PROMPT},
-                    ],
-                }
-            ],
         )
-
-        raw_text = response.content[0].text
         fields = _parse_response(raw_text)
 
         # Normalise sections_charged to list or null
@@ -138,8 +123,8 @@ def extract_fir_details(image_path: str) -> dict:
             "confidence_score": confidence_score,
         }
 
-    except (anthropic.APIError, anthropic.APIConnectionError, anthropic.RateLimitError) as exc:
-        raise RuntimeError(f"Anthropic API error: {exc}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"Vision LLM error: {exc}") from exc
     finally:
         if enhanced_path and os.path.exists(enhanced_path):
             os.unlink(enhanced_path)

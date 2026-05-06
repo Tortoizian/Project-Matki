@@ -165,44 +165,30 @@ def _run_vision(image: Optional[UploadFile]) -> tuple[Optional[dict], dict]:
 
 
 def _run_rag(fir_data: dict) -> tuple[list[dict], dict]:
-    """Builds the query, runs three RAG lookups, dedupes, and returns context."""
+    """JSON-backed retrieval: looks up each charged section in bns_bail_mapping.json."""
     sections = fir_data.get("sections_charged") or []
-    days = fir_data.get("days_in_custody")
-    primary_query = (
-        f"bail eligibility sections {','.join(sections) if sections else 'unknown'} "
-        f"days in custody {days if days is not None else 'unknown'}"
-    )
-    fixed_queries = [
-        "Section 479 BNSS default bail",
-        "Section 187 charge sheet timeline",
-    ]
-
     aggregated: list[dict] = []
-    seen: set[tuple[str, str]] = set()
 
-    target_section = sections[0] if sections else None
-
-    for q in [primary_query] + fixed_queries:
+    for sec in sections:
         try:
-            ctx = get_relevant_legal_context(q, target_section if q == primary_query else None)
-            for chunk in ctx.get("retrieved_chunks", []):
-                meta = chunk.get("metadata", {}) or {}
-                key = (meta.get("section_number") or meta.get("case_name") or "", chunk.get("content", "")[:80])
-                if key in seen:
-                    continue
-                seen.add(key)
+            ctx = get_relevant_legal_context(query="", target_bns_section=str(sec))
+            offence = ctx.get("structured_offence_data") or {}
+            if offence:
                 aggregated.append({
-                    "section_number": meta.get("section_number"),
-                    "case_name": meta.get("case_name"),
-                    "text": chunk.get("content", ""),
-                    "prisoner_rights_summary": meta.get("bail_topic") or meta.get("law_type") or "",
+                    "section_number": offence.get("bns_section"),
+                    "text": (
+                        f"{offence.get('offence_name', '')}. "
+                        f"Punishment: {offence.get('punishment', '')}. "
+                        f"Bailable: {offence.get('is_bailable', 'Unknown')}. "
+                        f"Cognizable: {offence.get('cognizable', 'Unknown')}."
+                    ),
+                    "prisoner_rights_summary": offence.get("satender_category", ""),
                 })
         except Exception as exc:
-            logger.warning("RAG query failed for '%s': %s", q, exc)
+            logger.warning("RAG lookup failed for section %s: %s", sec, exc)
 
-    if not aggregated:
-        logger.warning("RAG returned no results — falling back to hardcoded BNSS context.")
-        aggregated = list(EMERGENCY_LEGAL_CONTEXT)
+    # Always append the procedural BNSS sections that govern bail timelines.
+    aggregated.extend(EMERGENCY_LEGAL_CONTEXT)
 
     sections_found = sorted({c["section_number"] for c in aggregated if c.get("section_number")})
     return aggregated, {"sections_found": len(sections_found), "sections": sections_found}
@@ -373,10 +359,12 @@ async def process_case(
 
 @app.get("/health")
 def health() -> dict:
-    bnss_loaded = VECTOR_DIR.exists() and any(VECTOR_DIR.iterdir())
+    bnss_json = Path(__file__).parent / "bns_bail_mapping.json"
+    bnss_loaded = bnss_json.exists()
+    from llm_client import model_name
     return {
         "status": "ok",
-        "model": "claude-sonnet-4-5",
+        "model": model_name(),
         "bnss_loaded": bnss_loaded,
     }
 
