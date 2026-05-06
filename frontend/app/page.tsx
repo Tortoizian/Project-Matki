@@ -23,8 +23,8 @@ import {
 // Config
 // ---------------------------------------------------------------------------
 
-const API_BASE =
-  process.env.NEXT_PUBLIC_MUKTI_API_BASE || "http://localhost:8000";
+const API_URL =
+  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -104,7 +104,7 @@ export default function MuktiWizard() {
     fd.append("approved", "false");
 
     try {
-      const res = await fetch(`${API_BASE}/process-case`, {
+      const res = await fetch(`${API_URL}/process-case`, {
         method: "POST",
         body: fd,
       });
@@ -139,7 +139,7 @@ export default function MuktiWizard() {
     fd.append("approved", "true");
 
     try {
-      const res = await fetch(`${API_BASE}/process-case`, {
+      const res = await fetch(`${API_URL}/process-case`, {
         method: "POST",
         body: fd,
       });
@@ -625,7 +625,7 @@ function SuccessStep({
 }) {
   const downloadHref = generated.download_url.startsWith("http")
     ? generated.download_url
-    : `${API_BASE}${generated.download_url}`;
+    : `${API_URL}${generated.download_url}`;
 
   const cs = generated.court_status;
   const courtFound = cs && cs.status !== "not_found";
