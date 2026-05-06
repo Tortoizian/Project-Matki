@@ -1,5 +1,5 @@
 # Deployment Link
-project-mukti-two.vercel.app
+https://project-mukti-tortoizians-projects.vercel.app/
 
 # Project Mukti
 
