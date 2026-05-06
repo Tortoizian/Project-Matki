@@ -83,7 +83,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://project-mukti-two.vercel.app/",
+        "https://project-mukti-two.vercel.app",
         "http://localhost:3000"
     ],
     allow_credentials=True,
