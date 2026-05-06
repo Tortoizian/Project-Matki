@@ -147,14 +147,17 @@ def _save_upload_to_tmp(image: UploadFile) -> str:
 
 def _run_vision(image: Optional[UploadFile]) -> tuple[Optional[dict], dict]:
     """Returns (fir_data_or_none, vision_step_info)."""
-    if image is None:
+    if image is None or not image.filename:
+        logger.info("No image provided. Skipping vision step.")
         return None, {"success": False, "confidence": 0, "skipped": True}
 
     tmp_path = None
     try:
+        logger.info("Starting vision extraction...")
         tmp_path = _save_upload_to_tmp(image)
         result = extract_fir_details(tmp_path)
         confidence = int(result.get("confidence_score", 0))
+        logger.info("Vision extraction complete. Extracted data: %s", result)
         return result, {"success": True, "confidence": confidence}
     except Exception as exc:
         logger.exception("Vision step failed: %s", exc)
@@ -167,6 +170,7 @@ def _run_vision(image: Optional[UploadFile]) -> tuple[Optional[dict], dict]:
 def _run_rag(fir_data: dict) -> tuple[list[dict], dict]:
     """JSON-backed retrieval: looks up each charged section in bns_bail_mapping.json."""
     sections = fir_data.get("sections_charged") or []
+    logger.info("Starting RAG lookup for sections: %s", sections)
     aggregated: list[dict] = []
 
     for sec in sections:
@@ -174,6 +178,7 @@ def _run_rag(fir_data: dict) -> tuple[list[dict], dict]:
             ctx = get_relevant_legal_context(query="", target_bns_section=str(sec))
             offence = ctx.get("structured_offence_data") or {}
             if offence:
+                logger.info("RAG found info for section %s: %s", sec, offence.get('offence_name'))
                 aggregated.append({
                     "section_number": offence.get("bns_section"),
                     "text": (
@@ -191,14 +196,20 @@ def _run_rag(fir_data: dict) -> tuple[list[dict], dict]:
     aggregated.extend(EMERGENCY_LEGAL_CONTEXT)
 
     sections_found = sorted({c["section_number"] for c in aggregated if c.get("section_number")})
+    logger.info("RAG complete. Total specific sections found: %d", len(sections_found) - 3)
     return aggregated, {"sections_found": len(sections_found), "sections": sections_found}
 
 
 def _run_audit(fir_data: dict, legal_context: list[dict]) -> tuple[dict, dict]:
     try:
+        logger.info("Starting Audit step. Calculating bail score...")
         score = calculate_bail_score(fir_data, date.today())
+        logger.info("Bail score calculated: %d. Grounds found: %s", score.get("score", 0), score.get("reasons", []))
+        
+        logger.info("Generating plain language report with LLM...")
         report = generate_bail_report(fir_data, score, legal_context)
         report_dict = report.to_dict()
+        logger.info("Audit report generated successfully.")
         return report_dict, {
             "confidence_score": report_dict["confidence_score"],
             "bail_grounds": report_dict["bail_grounds"],
@@ -228,9 +239,11 @@ async def _run_generation(
 ) -> tuple[dict, Optional[dict]]:
     """Returns (generation_step_info, court_status_or_none)."""
     if not approved:
+        logger.info("Application not yet approved. Preparing review preview...")
         preview = prepare_application_for_review(report)
         return {"approved": False, "pdf_url": None, "preview": preview["preview"]}, None
 
+    logger.info("Application approved. Generating PDF...")
     fir_no = (report.get("fir_number") or "unknown").replace("/", "-")
     filename = f"bail_application_{fir_no}_{uuid.uuid4().hex[:8]}.pdf"
     pdf_path = OUTPUT_DIR / filename
@@ -239,13 +252,16 @@ async def _run_generation(
     try:
         generate_bail_pdf(report, str(pdf_path), approved=True)
         pdf_url = f"/download/{filename}"
+        logger.info("PDF generated successfully at %s", pdf_path)
     except Exception as exc:
         logger.exception("PDF generation failed: %s", exc)
 
     court_status: Optional[dict] = None
     if cnr_number:
+        logger.info("Fetching eCourts status for CNR: %s", cnr_number)
         try:
             court_status = await get_case_status(cnr_number)
+            logger.info("eCourts status fetched: %s", court_status.get("status"))
         except Exception as exc:
             logger.warning("eCourts lookup failed: %s", exc)
             court_status = {"source": "error", "cnr": cnr_number, "error": str(exc)}

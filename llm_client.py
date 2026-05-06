@@ -10,8 +10,10 @@ from __future__ import annotations
 import os
 from typing import Optional
 
+from dotenv import load_dotenv
 import google.generativeai as genai
 
+load_dotenv()
 
 _DEFAULT_MODEL = os.environ.get("MUKTI_GEMINI_MODEL", "gemini-1.5-pro")
 _API_KEY = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
@@ -62,14 +64,19 @@ def generate_with_image(
     *,
     max_tokens: int = 1500,
     model: Optional[str] = None,
+    json_mode: bool = False,
 ) -> str:
     _ensure_configured()
     m = genai.GenerativeModel(
         model or _DEFAULT_MODEL,
         system_instruction=system_prompt,
     )
+    gen_config = {"max_output_tokens": max_tokens, "temperature": 0.2}
+    if json_mode:
+        gen_config["response_mime_type"] = "application/json"
+    
     resp = m.generate_content(
         [{"mime_type": mime_type, "data": image_bytes}, user_prompt],
-        generation_config={"max_output_tokens": max_tokens, "temperature": 0.2},
+        generation_config=gen_config,
     )
     return (resp.text or "").strip()

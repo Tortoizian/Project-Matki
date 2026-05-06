@@ -78,12 +78,18 @@ def _parse_response(text: str) -> dict:
     if match:
         text = match.group(1)
     else:
-        # Find the first { … } block
+        # Find the first { … } block (if it's not already just a dict)
         start = text.find("{")
         end = text.rfind("}") + 1
         if start != -1 and end > start:
             text = text[start:end]
-    return json.loads(text)
+            
+    # Sometimes json mode forces it to be a raw dict with no markup
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        print(f"Failed to parse text as JSON. Raw text was:\n{text}")
+        raise exc
 
 
 def extract_fir_details(image_path: str) -> dict:
@@ -104,6 +110,7 @@ def extract_fir_details(image_path: str) -> dict:
             image_bytes=image_bytes,
             mime_type=media_type,
             max_tokens=1024,
+            json_mode=True,
         )
         fields = _parse_response(raw_text)
 
